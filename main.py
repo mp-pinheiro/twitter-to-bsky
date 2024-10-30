@@ -12,7 +12,7 @@ from collections import defaultdict, deque
 from urllib.parse import urlparse
 
 import ffmpeg
-import regex  # For accurate grapheme counting
+import regex
 import requests
 from dotenv import load_dotenv
 from tqdm import tqdm
@@ -20,7 +20,7 @@ from urllib3.util.retry import Retry
 
 load_dotenv()
 
-TWEETS_JS_PATH = "./data/tweets.js.small"
+TWEETS_JS_PATH = "./data/tweets.js"
 MIGRATED_TWEETS_DIR = "./migrated_tweets/"
 FAILED_TWEETS_FILE = "./data/failed_tweets.json"
 MEDIA_DIR = "./media/"
@@ -28,22 +28,25 @@ MEDIA_DIR = "./media/"
 USERNAME = os.environ.get("BSKY_USERNAME")
 PASSWORD = os.environ.get("PASSWORD")
 BASE_URL = os.environ.get("BSKY_BASE_URL", "https://bsky.social")
+USE_LOG_FILE = os.environ.get("USE_LOG_FILE", "False").lower() == "true"
 
-# Configure logging
-# logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(message)s", filename="migration.log")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(message)s")
+# configure logging
+if USE_LOG_FILE:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(message)s", filename="migration.log")
+else:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(message)s")
 
-# Ensure necessary directories exist
+# ensure necessary directories exist
 os.makedirs(MEDIA_DIR, exist_ok=True)
 os.makedirs(MIGRATED_TWEETS_DIR, exist_ok=True)
 
-# Read tweets.js file
+# read tweets.js file
 with open(TWEETS_JS_PATH, "r", encoding="utf-8") as f:
     content = f.read()
     content = content.replace("window.YTD.tweets.part0 = ", "")
     tweets_data_raw = json.loads(content)
 
-# Build a mapping from tweet ID to tweet data
+# build a mapping from tweet ID to tweet data
 tweet_id_map = {}
 for tweet_entry in tweets_data_raw:
     tweet = tweet_entry["tweet"]
@@ -81,16 +84,14 @@ def get_text_and_facets(tweet):
     entities = tweet.get("entities", {})
     facets = []
 
-    # Process URLs
     for url_entity in entities.get("urls", []):
-        # Get the indices and URL
         start, end = map(int, url_entity["indices"])
         expanded_url = url_entity["expanded_url"]
 
-        # Replace the URL text in the tweet text with the expanded URL
+        # replace the URL text in the tweet text with the expanded URL
         text = text[:start] + expanded_url + text[end:]
 
-        # Adjust facets
+        # adjust facets
         byte_start, byte_end = calculate_byte_indices(text, start, start + len(expanded_url))
         facets.append(
             {
@@ -104,18 +105,16 @@ def get_text_and_facets(tweet):
             }
         )
 
-    # Remove video links from the text
-    extended_entities = tweet.get("extended_entities", {})
-    for media in extended_entities.get("media", []):
-        if media.get("type") == "video":
-            url = media.get("url")
-            if url:
-                text = text.replace(url, "")
+    # remove media URLs from the text
+    media_entities = tweet.get("extended_entities", {}).get("media", [])
+    media_urls = [media.get("url") for media in media_entities if media.get("url")]
+    for media_url in media_urls:
+        text = text.replace(media_url, "")
 
-    # Process hashtags using the correct facet type
+    # process hashtags using the correct facet type
     hashtags = extract_hashtags(text)
     for hashtag_info in hashtags:
-        hashtag = hashtag_info["hashtag"][1:]  # Remove '#' from the hashtag
+        hashtag = hashtag_info["hashtag"][1:]  # remove '#' from the hashtag
         start = hashtag_info["start"]
         end = hashtag_info["end"]
         byte_start, byte_end = calculate_byte_indices(text, start, end)
@@ -130,6 +129,8 @@ def get_text_and_facets(tweet):
                 ],
             }
         )
+
+    text = text.strip()
 
     return text, facets
 
@@ -156,15 +157,16 @@ def truncate_text_and_update_facets(text, facets, max_graphemes=300):
     if len(graphemes) <= max_graphemes:
         return text, facets
     else:
-        # Determine the truncation point without cutting off any facet
+        # determine the truncation point without cutting off any facet
         truncation_point = 0
         current_graphemes = 0
         for i, g in enumerate(graphemes):
             char_index = len("".join(graphemes[:i]))
-            # Check if any facet starts after this point
+            # check if any facet starts after this point
             if current_graphemes >= max_graphemes:
                 break
-            # Check if this character is within any facet
+
+            # check if this character is within any facet
             within_facet = False
             for facet in facets:
                 facet_char_start = len(
@@ -184,10 +186,9 @@ def truncate_text_and_update_facets(text, facets, max_graphemes=300):
                 current_graphemes = facet_end_grapheme
                 truncation_point = facet_end_grapheme
 
-        # Truncate text
         truncated_text = "".join(graphemes[:truncation_point]) + "…"
 
-        # Remove facets that are beyond the truncated text
+        # remove facets that are beyond the truncated text
         new_facets = []
         truncated_byte_length = len(truncated_text.encode("utf-8"))
         for facet in facets:
@@ -199,25 +200,23 @@ def truncate_text_and_update_facets(text, facets, max_graphemes=300):
 
 def download_media(media_url, tweet_id, media_type):
     max_retries = 5
-    backoff_factor = 1  # Adjust as needed
+    backoff_factor = 1
 
     for attempt in range(1, max_retries + 1):
         try:
-            # Make the request to download the media
             response = requests.get(media_url, stream=True)
             response.raise_for_status()
 
-            # Extract the file extension from the URL
             parsed_url = urlparse(media_url)
             path = parsed_url.path
             extension = os.path.splitext(path)[1]
 
-            # If extension is missing, try to get it from the Content-Type header
+            # if no extension, try to guess from content type
             if not extension:
                 content_type = response.headers.get("Content-Type", "").split(";")[0]
                 extension = mimetypes.guess_extension(content_type) or ""
 
-            # If still no extension, set a default based on media_type
+            # if still no extension, set a default based on media_type
             if not extension:
                 if media_type == "video":
                     extension = ".mp4"
@@ -226,16 +225,12 @@ def download_media(media_url, tweet_id, media_type):
                 else:
                     extension = ""
 
-            # Construct the filename
             basename = os.path.basename(path)
             if not os.path.splitext(basename)[1]:
                 basename += extension
             filename = f"{MEDIA_DIR}{tweet_id}_{basename}"
 
-            # Log the media type and file name
             logging.info(f"Downloading {media_type} from {media_url} as {filename}")
-
-            # Download and save the file
             with open(filename, "wb") as f:
                 for chunk in response.iter_content(8192):
                     f.write(chunk)
@@ -274,7 +269,7 @@ def upload_image(filepath, access_token, session):
 
 
 def upload_video(filepath, access_token, did, session):
-    # Get service auth for upload with proper authentication
+    # get service auth token
     service_auth_url = f"{BASE_URL}/xrpc/com.atproto.server.getServiceAuth"
     service_auth_data = {
         "aud": f"did:web:{BASE_URL.split('//')[-1]}",
@@ -285,7 +280,7 @@ def upload_video(filepath, access_token, did, session):
         "Authorization": f"Bearer {access_token}",
     }
 
-    # Make a GET request to the service auth URL with proper headers
+    # make a GET request to the service auth URL with proper headers
     service_auth_response = session.get(service_auth_url, params=service_auth_data, headers=headers)
     service_auth = service_auth_response.json()
 
@@ -295,7 +290,7 @@ def upload_video(filepath, access_token, did, session):
         logging.error("Auth token is missing from the service auth response")
         return None
 
-    # Upload the video
+    # upload the re-encoded video with progress tracking
     file_size = os.path.getsize(filepath)
     upload_url = "https://video.bsky.app/xrpc/app.bsky.video.uploadVideo"
     headers = {
@@ -325,7 +320,7 @@ def upload_video(filepath, access_token, did, session):
                 logging.error(f"SSL error occurred during video upload: {str(e)}")
                 return None
 
-    # Get job status and blob
+    # get job status and blob
     upload_result = upload_response.json()
     job_id = upload_result.get("jobId")
     if not job_id:
@@ -414,14 +409,14 @@ def post_to_bluesky(full_text, media_files, reply_to, created_at_iso, access_tok
                 "createdAt": created_at_iso,
             }
 
-            # Handle replies
+            # include reply info if available
             if reply_to:
                 record["reply"] = {
                     "root": {"cid": reply_to["root_cid"], "uri": reply_to["root_uri"]},
                     "parent": {"cid": reply_to["cid"], "uri": reply_to["uri"]},
                 }
 
-            # Handle media
+            # include media files if available
             if media_files:
                 images = []
                 videos = []
@@ -458,11 +453,11 @@ def post_to_bluesky(full_text, media_files, reply_to, created_at_iso, access_tok
                     logging.error("Cannot upload both images and videos in one post. Proceeding with images.")
                     record["embed"] = {"$type": "app.bsky.embed.images", "images": images}
 
-            # Include facets for hashtags and URLs
+            # include facets if available
             if facets:
                 record["facets"] = facets
 
-            # Post the record
+            # create the post
             post_data = create_post(record, access_token, did, session)
             if post_data:
                 bluesky_post_info = {"uri": post_data["uri"], "cid": post_data["cid"]}
@@ -511,7 +506,6 @@ def process_tweet(tweet_id, access_token, did, processed_tweets, session):
         return True
 
     if tweet_id in processed_tweets:
-        # Already processed in this run
         return True
 
     tweet = tweet_id_map.get(tweet_id)
@@ -519,7 +513,7 @@ def process_tweet(tweet_id, access_token, did, processed_tweets, session):
         logging.error(f"Tweet {tweet_id} not found in tweet_id_map.")
         return False
 
-    # Check if the tweet is a retweet
+    # don't process retweets
     full_text = tweet.get("full_text")
     if not full_text or full_text.startswith("RT @"):
         logging.info(f"Skipping retweet {tweet_id}")
@@ -530,7 +524,7 @@ def process_tweet(tweet_id, access_token, did, processed_tweets, session):
     in_reply_to_status_id = tweet.get("in_reply_to_status_id_str")
     reply_to_info = None
     if in_reply_to_status_id:
-        # Ensure parent tweet is processed first
+        # parent tweets should be processed first
         if not is_tweet_migrated(in_reply_to_status_id):
             parent_processed = process_tweet(in_reply_to_status_id, access_token, did, processed_tweets, session)
             if not parent_processed:
@@ -538,7 +532,6 @@ def process_tweet(tweet_id, access_token, did, processed_tweets, session):
                 return False
         parent_info = get_migrated_tweet_info(in_reply_to_status_id)
         if parent_info:
-            # Get root info
             root_uri = parent_info.get("root_uri", parent_info["uri"])
             root_cid = parent_info.get("root_cid", parent_info["cid"])
             reply_to_info = {
@@ -550,13 +543,10 @@ def process_tweet(tweet_id, access_token, did, processed_tweets, session):
 
     logging.info(f"Processing tweet {tweet_id}")
 
-    # Get the tweet text and facets
     full_text, facets = get_text_and_facets(tweet)
-
-    # Truncate text and update facets if it exceeds 300 graphemes
     full_text, facets = truncate_text_and_update_facets(full_text, facets, max_graphemes=300)
 
-    # Get any media associated with the tweet
+    # get media associated with the tweet
     media_files = []
     media_entities = []
     if "extended_entities" in tweet:
@@ -575,7 +565,7 @@ def process_tweet(tweet_id, access_token, did, processed_tweets, session):
         if video_info:
             variants = video_info.get("variants")
             if variants:
-                # Get the highest bitrate video
+                # get the highest bitrate video
                 media_url = max(variants, key=lambda v: int(v.get("bitrate", 0))).get("url")
                 if not media_url:
                     continue
@@ -588,27 +578,28 @@ def process_tweet(tweet_id, access_token, did, processed_tweets, session):
             media_url = media.get("media_url_https") or media.get("media_url")
             if not media_url:
                 continue
+            filename = download_media(media_url, tweet_id, media_type)
 
         if filename:
             media_files.append(filename)
 
-    # Parse tweet creation date
+    # parse tweet creation date
     date_string = tweet.get("created_at")
     date_format = "%a %b %d %H:%M:%S %z %Y"
     parsed_date = datetime.datetime.strptime(date_string, date_format)
     iso_created_at = parsed_date.isoformat()
 
-    # Post to Bluesky
+    # post to Bluesky
     bluesky_post_info = post_to_bluesky(
         full_text, media_files, reply_to_info, iso_created_at, access_token, did, facets, session
     )
     if bluesky_post_info:
-        # Record the mapping
-        # If this tweet is a reply, set root_uri and root_cid accordingly
         if reply_to_info:
+            # if this tweet is a reply, set root_uri and root_cid accordingly
             root_uri = reply_to_info["root_uri"]
             root_cid = reply_to_info["root_cid"]
         else:
+            # if this tweet is not a reply, set root_uri and root_cid to the tweet itself
             root_uri = bluesky_post_info["uri"]
             root_cid = bluesky_post_info["cid"]
         bluesky_post_info.update({"root_uri": root_uri, "root_cid": root_cid})
@@ -644,7 +635,6 @@ def topological_sort(graph, indegree):
     queue = deque()
     order = []
 
-    # Start with nodes that have indegree 0
     for node in indegree:
         if indegree[node] == 0:
             queue.append(node)
@@ -659,7 +649,6 @@ def topological_sort(graph, indegree):
 
     if len(order) != len(indegree):
         logging.warning("Cycle detected in tweet dependencies. Some replies may not be properly linked.")
-        # Return the nodes processed so far
         return order
 
     return order
