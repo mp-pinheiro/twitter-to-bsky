@@ -129,3 +129,12 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+data
+assets
+*.html
+*.zip
+media
+test_js
+test.py
+migrated_tweets
