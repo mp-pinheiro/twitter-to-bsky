@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 from collections import defaultdict, deque
+from urllib.parse import urlparse
 
 import ffmpeg
 import regex  # For accurate grapheme counting
@@ -197,38 +198,62 @@ def truncate_text_and_update_facets(text, facets, max_graphemes=300):
 
 
 def download_media(media_url, tweet_id, media_type):
-    try:
-        # Make the request to download the media
-        response = requests.get(media_url, stream=True)
-        response.raise_for_status()
+    max_retries = 5
+    backoff_factor = 1  # Adjust as needed
 
-        # Choose extension based on the media type (video or photo)
-        if media_type == "video":
-            extension = ""  # TODO: fix this
-        elif media_type == "photo":
-            # Use mimetypes to guess the extension for photos
-            extension = mimetypes.guess_extension(response.headers.get("content-type", "").split(";")[0])
+    for attempt in range(1, max_retries + 1):
+        try:
+            # Make the request to download the media
+            response = requests.get(media_url, stream=True)
+            response.raise_for_status()
+
+            # Extract the file extension from the URL
+            parsed_url = urlparse(media_url)
+            path = parsed_url.path
+            extension = os.path.splitext(path)[1]
+
+            # If extension is missing, try to get it from the Content-Type header
             if not extension:
-                extension = os.path.splitext(media_url)[1]  # Fallback to extension from URL
-        else:
-            logging.error(f"Unknown media type {media_type} for media URL {media_url}")
+                content_type = response.headers.get("Content-Type", "").split(";")[0]
+                extension = mimetypes.guess_extension(content_type) or ""
+
+            # If still no extension, set a default based on media_type
+            if not extension:
+                if media_type == "video":
+                    extension = ".mp4"
+                elif media_type == "photo":
+                    extension = ".jpg"  # Default to jpg if unknown
+                else:
+                    extension = ""
+
+            # Construct the filename
+            basename = os.path.basename(path)
+            if not os.path.splitext(basename)[1]:
+                basename += extension
+            filename = f"{MEDIA_DIR}{tweet_id}_{basename}"
+
+            # Log the media type and file name
+            logging.info(f"Downloading {media_type} from {media_url} as {filename}")
+
+            # Download and save the file
+            with open(filename, "wb") as f:
+                for chunk in response.iter_content(8192):
+                    f.write(chunk)
+
+            return filename
+
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error downloading media {media_url} (attempt {attempt}): {e}")
+            if attempt < max_retries:
+                wait_time = backoff_factor * (2 ** (attempt - 1))
+                logging.info(f"Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                logging.error(f"Failed to download media {media_url} after {max_retries} attempts.")
+                return None
+        except Exception as e:
+            logging.error(f"Unexpected error downloading media {media_url}: {e}")
             return None
-
-        # Define the filename
-        filename = f"{MEDIA_DIR}{tweet_id}_{os.path.basename(media_url).split('?')[0]}{extension}"
-
-        # Log the media type and file name
-        logging.info(f"Downloading {media_type} from {media_url} as {filename}")
-
-        # Download and save the file
-        with open(filename, "wb") as f:
-            for chunk in response.iter_content(8192):
-                f.write(chunk)
-
-        return filename
-    except Exception as e:
-        logging.error(f"Error downloading media {media_url}: {e}")
-        return None
 
 
 def upload_image(filepath, access_token, session):
@@ -270,11 +295,9 @@ def upload_video(filepath, access_token, did, session):
         logging.error("Auth token is missing from the service auth response")
         return None
 
-    print("token", token)
-
     # Upload the video
     file_size = os.path.getsize(filepath)
-    upload_url = "https://bsky.social/xrpc/com.atproto.repo.uploadBlob"
+    upload_url = "https://video.bsky.app/xrpc/app.bsky.video.uploadVideo"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "video/mp4",
@@ -292,16 +315,23 @@ def upload_video(filepath, access_token, did, session):
                 upload_response = session.post(
                     upload_url,
                     headers=headers,
+                    params={
+                        "did": did,
+                        "name": os.path.basename(filepath),
+                    },
                     data=upload_generator(),
                 )
             except requests.exceptions.SSLError as e:
                 logging.error(f"SSL error occurred during video upload: {str(e)}")
                 return None
 
-    # Check the upload response
+    # Get job status and blob
     upload_result = upload_response.json()
-    print(upload_result)
-    job_id = upload_result["jobId"]
+    job_id = upload_result.get("jobId")
+    if not job_id:
+        logging.error(f"Failed to upload video: {upload_result}")
+        return None
+
     blob = None
     while not blob:
         job_status_url = "https://video.bsky.app/xrpc/app.bsky.video.getJobStatus"
@@ -313,18 +343,10 @@ def upload_video(filepath, access_token, did, session):
             logging.error(f"Video upload failed: {job_status.get('errorMessage')}")
             return None
 
-        blob = job_status.get("blob")
-        if not blob:
-            time.sleep(1)
+        job_status_data = job_status.get("jobStatus", {})
+        blob = job_status_data.get("blob")
 
-    if upload_response.status_code == 200:
-        blob_data = upload_response.json()
-        blob = blob_data["blob"]
-        blob["mimeType"] = "video/mp4"
-        return blob
-    else:
-        logging.error(f"Failed to upload video: {upload_response.status_code} {upload_response.text}")
-        return None
+    return blob
 
 
 def create_post(record, access_token, did, session):
@@ -424,14 +446,15 @@ def post_to_bluesky(full_text, media_files, reply_to, created_at_iso, access_tok
                 if images and not videos:
                     record["embed"] = {"$type": "app.bsky.embed.images", "images": images}
                 elif videos and not images:
-                    # Only one video is allowed per post
+                    if len(videos) > 1:
+                        logging.error("Only one video is allowed per post. Proceeding with the first video.")
+                        videos = videos[:1]
                     record["embed"] = {
-                        "$type": "app.bsky.embed.recordWithMedia",
-                        "record": {"$type": "app.bsky.embed.record", "record": {}},
-                        "media": {"$type": "app.bsky.embed.video", "videos": videos},
+                        "$type": "app.bsky.embed.video",
+                        "video": videos[0]["video"],
+                        "aspectRatio": videos[0]["aspectRatio"],
                     }
                 elif images and videos:
-                    # If both images and videos, log and proceed with images
                     logging.error("Cannot upload both images and videos in one post. Proceeding with images.")
                     record["embed"] = {"$type": "app.bsky.embed.images", "images": images}
 
@@ -548,6 +571,7 @@ def process_tweet(tweet_id, access_token, did, processed_tweets, session):
             continue  # Skip thumbnails
 
         video_info = media.get("video_info")
+        filename = None
         if video_info:
             variants = video_info.get("variants")
             if variants:
