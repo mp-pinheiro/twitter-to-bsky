@@ -28,7 +28,8 @@ MEDIA_DIR = "./media/"
 USERNAME = os.environ.get("BSKY_USERNAME")
 PASSWORD = os.environ.get("PASSWORD")
 BASE_URL = os.environ.get("BSKY_BASE_URL", "https://bsky.social")
-USE_LOG_FILE = os.environ.get("USE_LOG_FILE", "False").lower() == "true"
+USE_LOG_FILE = os.environ.get("USE_LOG_FILE", "True").lower() == "true"
+
 
 # configure logging
 if USE_LOG_FILE:
@@ -83,16 +84,43 @@ def get_text_and_facets(tweet):
     text = tweet["full_text"]
     entities = tweet.get("entities", {})
     facets = []
+    offset = 0
 
-    for url_entity in entities.get("urls", []):
+    # process URLs in reverse order to avoid affecting subsequent indices
+    for url_entity in sorted(entities.get("urls", []), key=lambda x: x["indices"][0], reverse=True):
         start, end = map(int, url_entity["indices"])
         expanded_url = url_entity["expanded_url"]
+        display_url = url_entity.get("display_url", url_entity["url"])
 
-        # replace the URL text in the tweet text with the expanded URL
-        text = text[:start] + expanded_url + text[end:]
+        # adjust start and end indices based on the current offset
+        start += offset
+        end += offset
 
-        # adjust facets
-        byte_start, byte_end = calculate_byte_indices(text, start, start + len(expanded_url))
+        # tentatively replace the URL with the expanded URL
+        tentative_text = text[:start] + expanded_url + text[end:]
+        tentative_graphemes = len(regex.findall(r"\X", tentative_text))
+
+        if tentative_graphemes <= 300:
+            replacement_url = expanded_url
+        else:
+            # try using the display URL
+            tentative_text = text[:start] + display_url + text[end:]
+            tentative_graphemes = len(regex.findall(r"\X", tentative_text))
+            if tentative_graphemes <= 300:
+                replacement_url = display_url
+            else:
+                # use the original shortened URL
+                replacement_url = url_entity["url"]
+
+        # replace the URL in the text
+        text = text[:start] + replacement_url + text[end:]
+
+        # calculate the change in length and update the offset
+        length_change = len(replacement_url) - (end - start)
+        offset += length_change
+
+        # calculate byte indices for the facet
+        byte_start, byte_end = calculate_byte_indices(text, start, start + len(replacement_url))
         facets.append(
             {
                 "index": {"byteStart": byte_start, "byteEnd": byte_end},
@@ -111,7 +139,7 @@ def get_text_and_facets(tweet):
     for media_url in media_urls:
         text = text.replace(media_url, "")
 
-    # process hashtags using the correct facet type
+    # process hashtags
     hashtags = extract_hashtags(text)
     for hashtag_info in hashtags:
         hashtag = hashtag_info["hashtag"][1:]  # remove '#' from the hashtag
@@ -131,7 +159,6 @@ def get_text_and_facets(tweet):
         )
 
     text = text.strip()
-
     return text, facets
 
 
@@ -522,6 +549,10 @@ def process_tweet(tweet_id, access_token, did, processed_tweets, session):
     processed_tweets.add(tweet_id)
 
     in_reply_to_status_id = tweet.get("in_reply_to_status_id_str")
+    if in_reply_to_status_id and in_reply_to_status_id not in tweet_id_map:
+        logging.info(f"Skipping tweet {tweet_id} (reply to a tweet not in dataset)")
+        return True
+
     reply_to_info = None
     if in_reply_to_status_id:
         # parent tweets should be processed first
@@ -665,6 +696,12 @@ def process_tweets(access_token, did, session):
     try:
         for tweet_id in processing_order:
             tweet = tweet_id_map.get(tweet_id)
+            if not tweet:
+                logging.warning(
+                    f"Skipping tweet {tweet_id} {tweet_id} not found in tweet_id_map, "
+                    "which might indicate a cycle or a reply to an unknown tweet."
+                )
+                continue
 
             full_text = tweet.get("full_text")
             if not full_text or full_text.startswith("RT @"):
