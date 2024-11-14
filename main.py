@@ -41,7 +41,7 @@ else:
 os.makedirs(MEDIA_DIR, exist_ok=True)
 os.makedirs(MIGRATED_TWEETS_DIR, exist_ok=True)
 
-# read tweets.js file
+# read archived tweets
 with open(TWEETS_JS_PATH, "r", encoding="utf-8") as f:
     content = f.read()
     content = content.replace("window.YTD.tweets.part0 = ", "")
